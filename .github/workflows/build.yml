@@ -1,0 +1,183 @@
+name: Build PZY MOVE HORRE
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+    paths:
+      - 'PZY_MOVE_HORRE_*_Source.zip'
+      - '.github/workflows/build.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Fabric 1.21.1 mod
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Extract and validate PZY source ZIP
+        id: source
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path, PurePosixPath
+          from zipfile import ZipFile
+          import os, re, stat
+
+          def version_key(path):
+              match = re.fullmatch(r"PZY_MOVE_HORRE_(\d+(?:\.\d+)*)_Source\.zip", path.name)
+              return tuple(int(part) for part in match.group(1).split(".")) if match else None
+
+          archives = [path for path in Path(".").glob("PZY_MOVE_HORRE_*_Source.zip") if version_key(path)]
+          if not archives:
+              raise SystemExit("No PZY_MOVE_HORRE_<version>_Source.zip found in repository root")
+          archive = max(archives, key=version_key)
+          version = ".".join(str(part) for part in version_key(archive))
+          if not archive.is_file() or archive.stat().st_size == 0:
+              raise SystemExit("Source ZIP is missing or empty")
+
+          destination = Path("project")
+          destination.mkdir(parents=True, exist_ok=True)
+          root = destination.resolve()
+          with ZipFile(archive) as source_zip:
+              damaged = source_zip.testzip()
+              if damaged:
+                  raise SystemExit(f"Corrupt ZIP entry: {damaged}")
+              for info in source_zip.infolist():
+                  entry = PurePosixPath(info.filename)
+                  if entry.is_absolute() or ".." in entry.parts:
+                      raise SystemExit(f"Unsafe ZIP path: {info.filename}")
+                  mode = (info.external_attr >> 16) & 0o170000
+                  if mode == stat.S_IFLNK:
+                      raise SystemExit(f"Symbolic link not permitted: {info.filename}")
+              source_zip.extractall(destination)
+
+          candidates = [destination] if (destination / "settings.gradle").is_file() else [
+              path.parent for path in destination.rglob("settings.gradle")
+          ]
+          candidates = [path for path in candidates if (path / "build.gradle").is_file()]
+          if len(candidates) != 1:
+              raise SystemExit(f"Expected exactly one Gradle project, found {len(candidates)}")
+          project_dir = candidates[0].resolve()
+          if not project_dir.is_relative_to(root):
+              raise SystemExit("Gradle project resolved outside extraction folder")
+
+          required = [
+              "settings.gradle",
+              "gradle.properties",
+              "src/main/resources/fabric.mod.json",
+              "src/main/resources/pzy_move_horre.mixins.json",
+              "src/main/java/pzy/move/horre/PzyMoveHorreClient.java",
+              "src/main/java/pzy/move/horre/render/PzyHandRenderer.java",
+              "src/main/java/pzy/move/horre/render/PzyRenderContext.java",
+              "src/main/java/pzy/move/horre/animation/PzyAnimationEngine.java",
+              "src/main/java/pzy/move/horre/animation/PzyActionTracker.java",
+              "src/main/java/pzy/move/horre/motion/PzyMotionTracker.java",
+              "src/main/java/pzy/move/horre/physics/PzyPhysicsSystem.java",
+              "src/main/java/pzy/move/horre/items/PzyItemClassifier.java",
+              "src/main/java/pzy/move/horre/items/PzyBlacklist.java",
+              "src/main/java/pzy/move/horre/packs/PzyPackManager.java",
+              "src/main/java/pzy/move/horre/profiles/PzyProfileManager.java",
+              "src/main/java/pzy/move/horre/mixin/client/ClientPlayerInteractionManagerMixin.java",
+              "src/main/java/pzy/move/horre/mixin/client/ItemRendererMixin.java",
+              "src/main/java/pzy/move/horre/gui/PzyConfigScreen.java",
+              "src/main/resources/assets/pzy_move_horre/icon.png",
+          ]
+          for relative in required:
+              if not (project_dir / relative).is_file():
+                  raise SystemExit(f"Required source file missing: {relative}")
+
+          properties = {}
+          for line in (project_dir / "gradle.properties").read_text(encoding="utf-8").splitlines():
+              line = line.strip()
+              if line and not line.startswith("#") and "=" in line:
+                  key, value = line.split("=", 1)
+                  properties[key.strip()] = value.strip()
+          if properties.get("mod_version") != version:
+              raise SystemExit(f"ZIP version {version} does not match mod_version={properties.get('mod_version')}")
+          if properties.get("minecraft_version") != "1.21.1":
+              raise SystemExit("This workflow expects Minecraft 1.21.1")
+
+          Path("project_dir.txt").write_text(str(project_dir), encoding="utf-8")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"version={version}\n")
+          print(f"Validated PZY source project {version}: {project_dir}")
+          PY
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+          cache-dependency-path: project/**/gradle.properties
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: '8.14.3'
+
+      - name: Build PZY MOVE HORRE
+        shell: bash
+        run: |
+          PROJECT_DIR="$(cat project_dir.txt)"
+          gradle --no-daemon --console=plain -p "$PROJECT_DIR" clean build
+
+      - name: Verify installable JAR
+        shell: bash
+        env:
+          PZY_VERSION: ${{ steps.source.outputs.version }}
+        run: |
+          PROJECT_DIR="$(cat project_dir.txt)"
+          JAR="$PROJECT_DIR/build/libs/pzy_move_horre-${PZY_VERSION}.jar"
+          test -s "$JAR"
+          python - "$JAR" "$PZY_VERSION" <<'PY'
+          import json
+          import sys
+          from zipfile import ZipFile
+
+          jar_path, version = sys.argv[1], sys.argv[2]
+          required = {
+              "fabric.mod.json",
+              "pzy_move_horre.mixins.json",
+              "pzy_move_horre.refmap.json",
+              "assets/pzy_move_horre/icon.png",
+              "assets/pzy_move_horre/lang/en_us.json",
+              "assets/pzy_move_horre/lang/th_th.json",
+              "pzy/move/horre/PzyMoveHorreClient.class",
+              "pzy/move/horre/render/PzyHandRenderer.class",
+              "pzy/move/horre/render/PzyRenderContext.class",
+              "pzy/move/horre/animation/PzyAnimationEngine.class",
+              "pzy/move/horre/animation/PzyActionTracker.class",
+              "pzy/move/horre/motion/PzyMotionTracker.class",
+              "pzy/move/horre/physics/PzyPhysicsSystem.class",
+              "pzy/move/horre/items/PzyItemClassifier.class",
+              "pzy/move/horre/items/PzyBlacklist.class",
+              "pzy/move/horre/mixin/client/ClientPlayerInteractionManagerMixin.class",
+              "pzy/move/horre/mixin/client/ItemRendererMixin.class",
+              "pzy/move/horre/gui/PzyConfigScreen.class",
+              "pzy/move/horre/packs/PzyPackManager.class",
+              "pzy/move/horre/profiles/PzyProfileManager.class",
+          }
+          with ZipFile(jar_path) as jar:
+              names = set(jar.namelist())
+              missing = sorted(required - names)
+              if missing:
+                  raise SystemExit("JAR is missing required files:\n" + "\n".join(missing))
+              metadata = json.loads(jar.read("fabric.mod.json"))
+              if metadata.get("id") != "pzy_move_horre" or metadata.get("version") != version:
+                  raise SystemExit("Unexpected mod ID or version in fabric.mod.json")
+          print(f"Verified PZY MOVE HORRE {version} installable JAR")
+          PY
+
+      - name: Upload installable JAR
+        uses: actions/upload-artifact@v4
+        with:
+          name: PZY-MOVE-HORRE-${{ steps.source.outputs.version }}-Fabric-1.21.1
+          path: project/**/build/libs/pzy_move_horre-${{ steps.source.outputs.version }}.jar
+          if-no-files-found: error
+          retention-days: 30
